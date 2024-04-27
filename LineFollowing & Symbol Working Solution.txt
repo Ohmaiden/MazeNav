@@ -1,0 +1,267 @@
+#include <stdio.h>
+// #include <ctime.h>
+#include "opencv_aee.hpp"
+#include "main.hpp"  // Used for declaring defined values and functions
+#include "pi2c.h"
+
+using namespace cv;
+using namespace std;
+
+
+
+// Configure the I2C interface to the Car as a global variable
+Pi2c carController(0x22);
+
+// Sets up the camera for OpenCV
+void setupCameraParameters() {
+  setupCamera(320, 240);
+}
+
+// Resizes the image to camera's dimensions
+Mat resizeImage(Mat shape, int resizeMethod) {
+  Mat resizedImage;
+  resize(shape, resizedImage, Size(320, 240), 0.0, 0.0, resizeMethod);
+  return resizedImage;
+}
+// Converts the input image to greyscale using HSV thresholding
+Mat convertToGreyscale(Mat resized_image) {
+  Mat image_HSV;
+  Mat image_GREY;
+
+  cvtColor(resized_image, image_HSV, COLOR_BGR2HSV);  // Convert the image to HSV
+  inRange(image_HSV, Scalar(128, 50, 50), Scalar(179, 255, 255), image_GREY);
+
+  return image_GREY;
+}
+void I2C(int16_t leftmotor, int16_t rightmotor, int16_t servoangle) {
+  char data[6];
+  data[0] = (leftmotor >> 8) & 0xFF;   // leftMotor_speed16_9
+  data[1] = leftmotor & 0xFF;          // leftMotor_speed8_1
+  data[2] = (rightmotor >> 8) & 0xFF;  // rightMotor_speed16_9
+  data[3] = rightmotor & 0xFF;         // rightMotor_speed8_1
+  data[4] = (servoangle >> 8) & 0xFF;  // servoAngle16_9
+  data[5] = servoangle & 0xFF;         // servoAngle8_1
+
+  carController.i2cWrite(data, 6);
+}
+
+
+int main(int argc, char** argv) {
+  setupCameraParameters();  // Call a setup function to prepare IO and devices
+
+
+  // PID controller coefficients
+  float kp = 50.0, ki = 0.8, kd = 1.1;
+
+  // Initial values for control and detection
+  float pinkCompareValue = 0, lineCompareValue = 0;
+  float setpoint = 0, error = 0, previousError = 0, totalError = 0, controlSignal = 0;
+  int servoAngle = 90, centerAngle = 115;
+  int16_t leftMotorSpeed = 100, rightMotorSpeed = 100;
+  int hueLow = 0, hueHigh = 180, satLow = 0, satHigh = 102, valLow = 0, valHigh = 64;
+
+  int counter = 0;
+  // const clock_t start = clock();
+  //int currentTime = 0;
+  //const int delay = 3;
+
+  // Image processing variables
+  Mat triangle = imread("Triangle.png");
+  Mat circle = imread("Circle.png");
+  Mat star = imread("Star.png");
+  Mat umbrella = imread("Umbrella.png");
+  Mat blackImage = imread("Black_Image.png");  // Added missing semicolon
+
+  // Calculate resize method based on aspect ratio
+  double origAspect = triangle.cols / static_cast<double>(triangle.rows);
+  double targetAspect = 320.0 / 240.0;
+  int resizeMethod = origAspect > targetAspect ? INTER_AREA : INTER_CUBIC;
+
+
+  // Resize and convert images to grayscale
+  triangle = resizeImage(triangle, resizeMethod);
+  circle = resizeImage(circle, resizeMethod);
+  star = resizeImage(star, resizeMethod);
+  umbrella = resizeImage(umbrella, resizeMethod);
+  blackImage = resizeImage(blackImage, resizeMethod);
+
+  triangle = convertToGreyscale(triangle);
+  circle = convertToGreyscale(circle);
+  star = convertToGreyscale(star);
+  umbrella = convertToGreyscale(umbrella);
+  blackImage = convertToGreyscale(blackImage);
+
+  while (1)  // Main loop to perform image processing
+  {
+
+    Mat frame, frameHSV, frameBlack, framePink, storedTransform;
+    int start = 0, finish = 0;
+
+    // Capture a frame from the camera
+    while (frame.empty()) {
+      frame = captureFrame();  // Function to capture a frame (needs to be defined if not already)
+    }
+
+    // Convert captured frame to HSV color space
+    cvtColor(frame, frameHSV, COLOR_BGR2HSV);
+
+    // Detect specific color ranges in the frame
+    inRange(frameHSV, Scalar(128, 25, 15), Scalar(179, 255, 255), framePink);                          // Detects a pink color range
+    inRange(frameHSV, Scalar(hueLow, satLow, valLow), Scalar(hueHigh, satHigh, valHigh), frameBlack);  // Detects a black color range
+
+    // Crop the frames to focus on specific areas of interest
+    frameBlack = frameBlack(Rect(0, 0, 320, 20));  // Focus on a narrow strip for line detection
+    framePink = framePink(Rect(0, 0, 320, 160));   // Larger area for symbol detection
+
+    // Apply a filter to smooth/erode the detected areas, enhancing detection
+    Mat spotFilter = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    erode(framePink, framePink, spotFilter);  // Eroding the pink frame to enhance symbol detection
+
+    // Compare the processed frame with a predefined image or criteria
+    float pinkCompareValue = compareImages(framePink, storedTransform);  // Function to compare two images (needs to be defined)
+
+    if (pinkCompareValue < 75) {  // Threshold to determine if the symbol is detected
+      // Stop the car by sending a stop command through I2C
+      controlCar(0, 0, servoAngle);  // Stops both motors
+
+      cout << "Stopped to detect the symbol" << endl;
+
+      // Detect contours in the pink frame for shape analysis
+      vector<vector<Point>> contours;
+      vector<Vec4i> hierarchy;
+      findContours(framePink, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+
+      vector<vector<Point>> approxContours(contours.size());
+
+      // Approximate the contours to simplify shapes
+      for (size_t i = 0; i < contours.size(); ++i) {
+        approxPolyDP(contours[i], approxContours[i], 10, true);
+
+        // Check if the approximated contour can be considered a candidate for symbol recognition
+        if (approxContours[i].size() == 4) {                                               // Assuming we're looking for quadrilateral symbols
+          Mat transformed = transformPerspective(approxContours[i], framePink, 320, 240);  // Perspective transformation
+
+          if (!transformed.empty()) {
+            cout << "Symbol detected" << endl;
+            rotate(transformed, transformed, ROTATE_180);  // Adjusting orientation
+            Mat maskMorph = getStructuringElement(MORPH_RECT, Size(10, 10));
+            dilate(transformed, transformed, maskMorph);  // Enhancing the symbol for better recognition
+            storedTransform = transformed;                // Storing the transformed symbol for comparison
+          }
+        }
+      }
+    }
+  }
+
+
+  // Comparing the stored transformed image with predefined shapes
+  float matchTriangle = compareImages(storedTransform, triangle);
+  float matchCircle = compareImages(storedTransform, circle);
+  float matchStar = compareImages(storedTransform, star);
+  float matchUmbrella = compareImages(storedTransform, umbrella);
+
+  // Determine the detected shape based on the comparison scores
+  if (matchTriangle > 5 && matchTriangle > matchCircle && matchTriangle > matchStar && matchTriangle > matchUmbrella) {
+    cout << "Triangle detected." << endl;
+    // Set HSV thresholds for the next target (Blue)
+    hueLow = 50;
+    hueHigh = 130;
+    satLow = 140;
+    satHigh = 255;
+    valLow = 60;
+    valHigh = 255;
+    cout << "Following Blue." << endl;
+  } else if (matchCircle > 5 && matchCircle > matchTriangle && matchCircle > matchStar && matchCircle > matchUmbrella) {
+    cout << "Circle detected." << endl;
+    // Set HSV thresholds for the next target (Red)
+    hueLow = 45;
+    hueHigh = 90;
+    satLow = 0;
+    satHigh = 255;
+    valLow = 60;
+    valHigh = 255;
+  } else if (matchStar > 5 && matchStar > matchCircle && matchStar > matchTriangle && matchStar > matchUmbrella) {
+    cout << "Star detected." << endl;
+    // Set HSV thresholds for the next target (Green)
+    hueLow = 75;
+    hueHigh = 81;
+    satLow = 193;
+    satHigh = 255;
+    valLow = 74;
+    valHigh = 255;
+  } else if (matchUmbrella > 5 && matchUmbrella > matchCircle && matchUmbrella > matchStar && matchUmbrella > matchTriangle) {
+    cout << "Umbrella detected." << endl;
+    // Set HSV thresholds for the next target (Yellow, adjust if necessary)
+    hueLow = 10
+    hueHigh = 35;
+    satLow = 75;
+    satHigh = 255;
+    valLow = 60;
+    valHigh = 255;
+  } else {
+    cout << "No shape detected." << endl;
+  }
+
+  // Line detection and following logic
+  bool initial = true;
+  uchar* pixelPtr = frameBlack.ptr<uchar>(20);  // Access the row at 20 pixels from the top
+
+  for (int x = 0; x < frameBlack.cols; x++) {
+    uchar pixel = pixelPtr[x];  // Access each pixel in the row
+    if (pixel == 255) {         // If the pixel is white, indicating part of the line
+      if (initial) {
+        start = x;  // Record the start of the line
+        initial = false;
+      }
+      finish = x;  // Update the end of the line as we progress
+    }
+  }
+
+  // Calculate the center position of the line
+  int center = (start + finish) / 2;
+  int deviation = center - (frameBlack.cols / 2);                                // Calculate deviation from the center
+  float controlSignal = static_cast<double>(deviation) / (frameBlack.cols / 2);  // Normalize deviation
+
+  // PID controller logic
+  previousError = error;
+  error = setpoint - controlSignal;
+  totalError += error;
+
+  float u = kp * error + ki * totalError + kd * (error - previousError);
+  servoAngle = centerAngle + static_cast<int>(u);
+
+  // Send control signals to the car
+  cout << "Servo angle: " << servoAngle << endl;
+  controlCar(90, 90, servoAngle);  // Send motor speeds and servo angle via I2C
+
+  // Compare the current line segment with a stored reference
+  float lineCompare = compareImages(storedTransform, frameBlack);
+  printf("Line compare: %f\n", lineCompare);
+
+  // Decision making based on line comparison
+  if (lineCompare == 100) {
+    cout << "Lost the line - switching to black" << endl;
+    hueLow = 0;
+    hueHigh = 180;
+    satLow = 0;
+    satHigh = 102;
+    valLow = 0;
+    valHigh = 64;
+  }
+
+  // Display the processed frames for debugging
+  imshow("Line Following", frameBlack);
+  imshow("Symbol Detection", framePink);
+
+  // Handle GUI events and check for exit condition
+  int key = waitKey(1);  // Wait 1ms for a keypress (required to update windows)
+  if (key == 27) {       // ESC key to exit
+    break;
+  }
+}
+
+// Cleanup and close OpenCV interfaces
+closeCV();  // Disable the camera and close any windows
+
+return 0;
+}

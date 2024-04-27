@@ -1,0 +1,107 @@
+#include <Wire.h>
+#define I2C_SLAVE_ADDRESS 0x04 // Define I2C address for the slave device
+
+#include <stdio.h>
+#include <Keypad.h>
+#include <LiquidCrystal.h>
+
+LiquidCrystal lcd(23, 2, 18, 17, 16, 15); // Initialize LCD
+
+void sendCarMovementCommands(int16_t leftMotorSpeed, int16_t rightMotorSpeed, int16_t servoSteeringAngle) {
+  Wire.beginTransmission(I2C_SLAVE_ADDRESS); // Start I2C transmission
+  Wire.write((byte)((leftMotorSpeed & 0xFF00) >> 8)); // Send high byte of leftMotorSpeed
+  Wire.write((byte)(leftMotorSpeed & 0x00FF));        // Send low byte of leftMotorSpeed
+  Wire.write((byte)((rightMotorSpeed & 0xFF00) >> 8)); // Send high byte of rightMotorSpeed
+  Wire.write((byte)(rightMotorSpeed & 0x00FF));        // Send low byte of rightMotorSpeed
+  Wire.write((byte)((servoSteeringAngle & 0xFF00) >> 8)); // Send high byte of servoSteeringAngle
+  Wire.write((byte)(servoSteeringAngle & 0x00FF));        // Send low byte of servoSteeringAngle
+  Wire.endTransmission(); // End transmission
+}
+
+int leftMotorSpeed = 100;
+int rightMotorSpeed = 100;
+int servoSteeringAngle = 105;
+char commands[20]; // Store input commands
+
+const byte ROWS = 4; // Number of rows in keypad
+const byte COLS = 3; // Number of columns in keypad
+char keys[ROWS][COLS] = {
+  {'1','2','3'},
+  {'4','5','6'},
+  {'7','8','9'},
+  {'*','0','#'}
+};
+byte rowPins[ROWS] = {32, 33, 25, 26}; // Connect to the row pinouts of the keypad
+byte colPins[COLS] = {27, 14, 13}; // Connect to the column pinouts of the keypad
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+void setup() {
+  Serial.begin(9600);
+  lcd.begin(16, 2);
+  lcd.clear();
+  Wire.begin(); // Start I2C as master
+}
+
+void loop() {
+  static int commandIndex = 0; // Static index for commands array
+  char key = keypad.getKey(); // Get the key pressed
+
+  if (key && key != '#') {
+    commands[commandIndex] = key; // Store the key in the commands array
+    commandIndex++; // Increment index for the next command
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(key); // Display the key on the LCD
+    Serial.println(key); // Print the key to serial monitor
+  } else if (key == '#') {
+    // Process commands when '#' is pressed
+    for (int i = 0; i < commandIndex; i++) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+
+      // Read encoder values before processing commands
+      int16_t encoderLeft = 0, encoderRight = 0;
+      Wire.requestFrom(I2C_SLAVE_ADDRESS, 4); // Request 4 bytes from slave device
+      encoderLeft = Wire.read() << 8 | Wire.read(); // Combine two bytes into one integer
+      encoderRight = Wire.read() << 8 | Wire.read(); // Combine two bytes into one integer
+      float distance = ((encoderLeft + encoderRight) / 2.0) * 0.1; // Example calculation for distance
+
+      switch (commands[i]) {
+        case '1':
+          lcd.print("Cmd 1: Action");
+          // Specific action for command '1'
+          break;
+        case '2':
+          sendCarMovementCommands(150, 150, 105); // Example: Move forward
+          lcd.print("Moving Forward");
+          break;
+        case '3':
+          // Specific action for command '3'
+          lcd.print("Cmd 3: Action");
+          break;
+        case '4':
+          sendCarMovementCommands(-100, 100, 105); // Example: Turn left
+          lcd.print("Turning Left");
+          break;
+        case '5':
+          sendCarMovementCommands(0, 0, 105); // Stop
+          lcd.print("Stop");
+          break;
+        case '6':
+          sendCarMovementCommands(100, -100, 105); // Example: Turn right
+          lcd.print("Turning Right");
+          break;
+        case '*':
+          // Reset commands and clear the screen
+          memset(commands, 0, sizeof(commands)); // Clear the commands array
+          commandIndex = 0; // Reset command index
+          lcd.print("Commands Cleared");
+          break;
+        // Implement other cases as needed
+      }
+      delay(2000); // Delay for readability between commands
+    }
+    // Reset for the next sequence of commands
+    commandIndex = 0;
+  }
+}
